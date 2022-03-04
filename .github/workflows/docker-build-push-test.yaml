@@ -1,0 +1,103 @@
+name: "Docker Build/Push and Deploy to k8s"
+
+# ## Doc ##
+# This pipeline requires some secrets to be set on the repository.
+# Secrets can be created under "Settings" on the repo, and then the sub-category "Secrets"
+# These secrets needs to be named:
+#    * registry_username - Containing ServicePrincipal ID (see: https://confluence.nrk.no/display/PLAT/Container+Registry#ContainerRegistry-TilgangfraCICD)
+#    * registry_password - Containing ServicePrincipal Secret
+#    * K8S_SA_SECRET     - Containing the whole secret object (yaml format) of the ServiceAccount GitHub Actions will use to deploy. (see: https://confluence.nrk.no/pages/viewpage.action?pageId=72122602 )
+#
+
+### Triggers ###
+# Criterias that needs to be met to run this pipeline see https://docs.github.com/en/actions/reference/events-that-trigger-workflows
+on:
+  push:
+    paths-ignore:
+    - '**/docker-build-push-main.yaml'
+    - '**/main/**'
+    - '**README.md'
+    branches:
+      - test
+    pull_request:
+      branches:
+        - test
+
+### Environment Variables ###
+# Define some standard (and required) environment variables
+env:
+  # Name of repository to use
+  REPOSITORY: plattform
+  # Name of image, preferably same as application name
+  IMAGE_NAME: {{APP_NAME}}
+  # URL to K8s API endpoint.
+  # You can find this parameter by being logged in the cluster you want to deploy to, and run "kubectl config view --minify -o 'jsonpath={.clusters[0].cluster.server}'
+  K8S_API_URL: {{K8S_API}}
+  # Namespace in K8s to do deployments
+  K8S_NAMESPACE: {{NAMESPACE}}
+  # Branch: this branch should be used as target directory when pushing the docker image upstream, so that the different pipelines push their images different places.
+  BRANCH: test
+
+### Jobs ###
+# The jobs and steps to perform
+# see https://docs.github.com/en/rest/reference/actions#workflow-jobs
+# and https://docs.github.com/en/actions/reference/context-and-expression-syntax-for-github-actions
+jobs:
+  # Build and Deploy job
+  build_and_deploy:
+    # Make the pipeline run on latest ubuntu
+    runs-on: ubuntu-20.04
+    steps:
+      # Log in to defined Registry to push to
+      - uses: docker/login-action@v1
+        with:
+          registry: ${{ secrets.PLATTFORM_CONTAINER_REGISTRY }}
+          username: ${{ secrets.PLATTFORM_ACR_PUSH_CLIENT_ID }}
+          password: ${{ secrets.PLATTFORM_ACR_PUSH_CLIENT_SECRET }}
+      # Recommended by docker build-push-action
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+      # Build the image, push without further tags (sha or latest) to make sure it will be tagged latest in Azure Registry.
+      - name: Build and push
+        id: docker_build
+        uses: docker/build-push-action@v2
+        with:
+          push: true
+          tags: ${{ secrets.PLATTFORM_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}/${{ env.BRANCH }}:${{ github.run_number }},${{ secrets.PLATTFORM_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}/${{ env.BRANCH }}:latest
+      - name: Output image digest for debugging purposes
+        run: echo ${{ steps.docker_build.outputs.digest }}
+      # Trivy test
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ secrets.PLATTFORM_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}/${{ env.BRANCH }}:latest'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+        env:
+          TRIVY_USERNAME: ${{ secrets.PLATTFORM_ACR_PUSH_CLIENT_ID }}
+          TRIVY_PASSWORD: ${{ secrets.PLATTFORM_ACR_PUSH_CLIENT_SECRET }}
+      # Checkout repo code
+      - uses: actions/checkout@v2
+      # Set k8s context to use (cluster and so on)
+      - uses: azure/k8s-set-context@v1
+        with:
+          method: service-account
+          k8s-url: ${{ env.K8S_API_URL }}
+          k8s-secret: ${{ secrets.K8S_SA_SECRET }}
+        id: setcontext
+      # Do the deploy on K8s cluster set in the above context
+      - uses: azure/k8s-deploy@v1
+        with:
+          namespace: ${{ env.K8S_NAMESPACE }}
+          manifests: |
+            manifests/test/deployment.yml
+            manifests/test/service.yml
+            manifests/test/ingress.yml
+          images: |
+            ${{ secrets.PLATTFORM_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}/${{ env.BRANCH }}:${{ github.run_number }}@${{ steps.docker_build.outputs.digest }}
+          kubectl-version: 'latest'
+        # Only run this steps if all the above steps is successful
+        if: ${{ success() }}
